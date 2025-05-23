@@ -3,9 +3,19 @@
 #include <vector>
 #include <memory>
 #include <atomic>
-#include <cmath> // For std::fabs, fmodf, floor
+#include <cmath> // For std::fabs, fmodf, floor, std::cyl_bessel_i (potentially with C++17, but provide fallback)
 #include <algorithm> // For std::clamp, std::min, std::transform, std::max
 #include <android/log.h>
+
+// Define M_PI if not already defined (common in cmath but not guaranteed by standard before C++20)
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+// Sinc Interpolation Parameters
+constexpr int NUM_TAPS = 16; // Number of points for interpolation
+constexpr int SUBDIVISION_STEPS = 1024; // Number of fractional offsets to pre-calculate
+constexpr double KAISER_BETA = 6.0;
 #include <android/asset_manager_jni.h> // For AAssetManager_fromJava
 #include <oboe/Oboe.h>
 #include <oboe/Utilities.h> // For oboe::convertToText
@@ -37,6 +47,14 @@ struct AudioSample {
     AudioEngine* audioEnginePtr = nullptr;
     std::atomic<bool> useEngineRateForPlayback_{false};
 
+    // Sinc table
+    static std::vector<std::vector<float>> sincTable;
+    static bool sincTableInitialized;
+    static void precalculateSincTable();
+    static double bessel_i0_approx(double x);
+    static double kaiserWindow(double n_rel, double N_total_taps, double beta);
+
+
     bool hasExtension(const std::string& path, const std::string& extension);
     bool tryLoadPath(AAssetManager* assetManager, const std::string& currentPathToTry);
     void load(AAssetManager* assetManager, const std::string& basePath, AudioEngine* engine);
@@ -66,11 +84,115 @@ struct AudioSample {
         return 0.0f;
     }
 
-    inline float catmullRomInterpolate(float p0, float p1, float p2, float p3, float t) const {
-        float t2 = t * t; float t3 = t2 * t;
-        return 0.5f * ((2.0f * p1) + (-p0 + p2) * t + (2.0f * p0 - 5.0f * p1 + 4.0f * p2 - p3) * t2 + (-p0 + 3.0f * p1 - 3.0f * p2 + p3) * t3);
-    }
+    // inline float catmullRomInterpolate(float p0, float p1, float p2, float p3, float t) const {
+    //     float t2 = t * t; float t3 = t2 * t;
+    //     return 0.5f * ((2.0f * p1) + (-p0 + p2) * t + (2.0f * p0 - 5.0f * p1 + 4.0f * p2 - p3) * t2 + (-p0 + 3.0f * p1 - 3.0f * p2 + p3) * t3);
+    // }
 };
+// Static member initialization
+std::vector<std::vector<float>> AudioSample::sincTable;
+bool AudioSample::sincTableInitialized = false;
+
+// Bessel function I0 approximation - using a common polynomial approximation
+// Valid for -3.75 <= x <= 3.75. For Kaiser, argument to I0 is beta * sqrt(1 - (term)^2), term is [-1,1]
+// So argument is [0, beta]. If beta is e.g. 6, this range is fine.
+// For x > 3.75, another approximation or asymptotic series would be needed, but for typical beta values, this is often sufficient.
+// Let's use a more general one from Numerical Recipes (approximation for I0(x))
+double AudioSample::bessel_i0_approx(double x) {
+    double ax = std::abs(x);
+    if (ax < 3.75) {
+        double y = x / 3.75;
+        y *= y;
+        return 1.0 + y * (3.5156229 + y * (3.0899424 + y * (1.2067492 + y * (0.2659732 + y * (0.0360768 + y * 0.0045813)))));
+    } else {
+        double y = 3.75 / ax;
+        return (std::exp(ax) / std::sqrt(ax)) * (0.39894228 + y * (0.01328592 + y * (0.00225319 + y * (-0.00157565 + y * (0.00916281 + y * (-0.02057706 + y * (0.02635537 + y * (-0.01647633 + y * 0.00392377))))))));
+    }
+}
+
+// n_rel: current sample index relative to the window center: 0 for center, +/- (N/2 -1) for edges
+// N_total_taps: total number of taps in the window
+double AudioSample::kaiserWindow(double n_rel_to_center, double N_total_taps, double beta) {
+    if (std::abs(n_rel_to_center) > (N_total_taps / 2.0 - 0.5) && N_total_taps > 1) { // check if n is outside the window span for N>1
+         // Should not happen if sincPoint is correctly calculated relative to window span
+        return 0.0; // Outside the window
+    }
+    // Argument for Kaiser window: (2.0 * n_abs_from_zero_indexed_start / (N_total_taps - 1)) - 1.0
+    // where n_abs_from_zero_indexed_start goes from 0 to N_total_taps-1
+    // If n_rel_to_center is - (N/2 - 1) ... 0 ... (N/2 - 1)
+    // then n_zero_indexed = n_rel_to_center + (N/2 -1)
+    // (2.0 * (n_rel_to_center + (N_total_taps/2.0 -1.0) ) / (N_total_taps -1.0) ) - 1.0
+    // This term inside sqrt: ( (2.0*n_idx_from_start) / (N-1) ) - 1.0; where n_idx_from_start is 0 to N-1
+    // Let's use a simpler formulation: term = n_rel_to_center / (N_total_taps/2.0)
+    // This makes 'term' go from -1 to 1 across the main lobe (approx)
+    double term_val_for_bessel_arg;
+    if (N_total_taps <= 1) term_val_for_bessel_arg = 0.0; // Single tap window is always 1.0
+    else term_val_for_bessel_arg = (2.0 * (n_rel_to_center + (N_total_taps/2.0 - 0.5)) / (N_total_taps - 1.0)) - 1.0;
+
+
+    double val_inside_sqrt = 1.0 - term_val_for_bessel_arg * term_val_for_bessel_arg;
+    if (val_inside_sqrt < 0) val_inside_sqrt = 0; // Clamp due to precision
+
+    return bessel_i0_approx(beta * std::sqrt(val_inside_sqrt)) / bessel_i0_approx(beta);
+}
+
+
+void AudioSample::precalculateSincTable() {
+    if (sincTableInitialized) return;
+
+    sincTable.resize(SUBDIVISION_STEPS, std::vector<float>(NUM_TAPS));
+    double I0_beta = bessel_i0_approx(KAISER_BETA); // Denominator for Kaiser window
+
+    for (int j = 0; j < SUBDIVISION_STEPS; ++j) {
+        double fractionalOffset = static_cast<double>(j) / SUBDIVISION_STEPS;
+
+        float sumCoeffs = 0.0f; // For normalization
+
+        for (int i = 0; i < NUM_TAPS; ++i) {
+            // sincPoint: distance from the tap 'i' to the desired interpolation point (fractionalOffset)
+            // The center of the NUM_TAPS samples is between tap NUM_TAPS/2 - 1 and NUM_TAPS/2.
+            // We want the filter kernel to be centered such that when fractionalOffset is 0,
+            // the interpolated point corresponds to the sample at index (NUM_TAPS/2 - 1) in the input kernel.
+            // Or, if we consider the "ideal" sample to be at `fractionalOffset` relative to `input_kernel[NUM_TAPS/2 -1]`.
+            // Let the current tap be `i`. Its position relative to the *start of the window* is `i`.
+            // The point we are interpolating *to* is `(NUM_TAPS/2 - 1) + fractionalOffset`.
+            // So, distance from tap `i` to this point is `i - ((NUM_TAPS/2 - 1) + fractionalOffset)`.
+            // Or, `( (double)i - (NUM_TAPS/2.0 - 1.0) ) - fractionalOffset` seems common.
+            // This makes `sincPoint` centered around `fractionalOffset`.
+            // If `i` is `NUM_TAPS/2 -1`, then `sincPoint = -fractionalOffset`.
+            // If `i` is `NUM_TAPS/2`, then `sincPoint = 1 - fractionalOffset`.
+            double sincPoint = (static_cast<double>(i) - (NUM_TAPS / 2.0 - 1.0)) - fractionalOffset;
+
+            double sincValue;
+            if (std::abs(sincPoint) < 1e-9) { // Check for sincPoint == 0
+                sincValue = 1.0;
+            } else {
+                sincValue = std::sin(M_PI * sincPoint) / (M_PI * sincPoint);
+            }
+
+            // For Kaiser window, 'n_rel' is distance from center of the window.
+            // Window is indexed 0 to NUM_TAPS-1. Center is at (NUM_TAPS-1)/2.0.
+            // So, n_rel = i - (NUM_TAPS-1)/2.0
+            double kaiser_n_rel = static_cast<double>(i) - (NUM_TAPS - 1.0) / 2.0;
+            double windowValue = kaiserWindow(kaiser_n_rel, NUM_TAPS, KAISER_BETA);
+            // The original kaiserWindow helper used n_rel_to_center directly, this is fine.
+            // double windowValue = kaiserWindow( (double)i - (NUM_TAPS/2.0 -1.0) , NUM_TAPS, KAISER_BETA); // This was less clear
+
+            sincTable[j][i] = static_cast<float>(sincValue * windowValue);
+            sumCoeffs += sincTable[j][i];
+        }
+
+        // Normalize coefficients to sum to 1.0 to ensure gain is preserved
+        if (std::abs(sumCoeffs) > 1e-6) { // Avoid division by zero if all coeffs are zero
+            for (int i = 0; i < NUM_TAPS; ++i) {
+                sincTable[j][i] /= sumCoeffs;
+            }
+        }
+    }
+    sincTableInitialized = true;
+    ALOGI("Sinc table precalculated: %d steps, %d taps. Beta: %f", SUBDIVISION_STEPS, NUM_TAPS, KAISER_BETA);
+}
+
 
 class AudioEngine : public oboe::AudioStreamCallback {
 public:
@@ -172,6 +294,9 @@ bool AudioSample::tryLoadPath(AAssetManager* assetManager, const std::string& cu
 }
 
 void AudioSample::load(AAssetManager* assetManager, const std::string& basePath, AudioEngine* engine) {
+    if (!sincTableInitialized) { // Ensure table is calculated, typically once per app run or if params change
+        precalculateSincTable();
+    }
     this->audioEnginePtr = engine; ALOGI("AudioSample: Attempting to load base path: %s", basePath.c_str());
     isPlaying.store(false); preciseCurrentFrame.store(0.0f); useEngineRateForPlayback_.store(false);
     playedOnce = false; loop.store(false); playOnceThenLoopSilently = false;
@@ -229,14 +354,39 @@ void AudioSample::getAudio(float* outputBuffer, int32_t numOutputFrames, int32_t
         }
         if (!isPlaying.load()) break;
 
-        float t = localPreciseCurrentFrame - std::floor(localPreciseCurrentFrame);
-        int32_t p1_idx = static_cast<int32_t>(std::floor(localPreciseCurrentFrame));
+        float fractionalTime = localPreciseCurrentFrame - std::floor(localPreciseCurrentFrame);
+        int32_t baseFrameIndex = static_cast<int32_t>(std::floor(localPreciseCurrentFrame));
+
+        // Determine index for sincTable lookup
+        int sincTableIndex = static_cast<int>(fractionalTime * SUBDIVISION_STEPS);
+        sincTableIndex = std::min(sincTableIndex, SUBDIVISION_STEPS - 1); // Clamp to max index
+
+        const std::vector<float>& coefficients = sincTable[sincTableIndex];
+
+        // Calculate start index for fetching samples for the convolution kernel
+        // The kernel is centered around a point "just before" baseFrameIndex if fractionalTime is 0.
+        // More precisely, for fractionalTime = 0, we want the output to be as close as possible
+        // to the sample at baseFrameIndex.
+        // The coefficients are indexed 0 to NUM_TAPS-1.
+        // If fractionalTime = 0, sincPoint for tap i is (i - (NUM_TAPS/2 - 1)).
+        // The peak of the sinc function (sincPoint=0) is when i = NUM_TAPS/2 - 1.
+        // So, coefficients[NUM_TAPS/2 - 1] should be multiplied by sample at baseFrameIndex.
+        // Thus, the first sample in our local kernel (kernelSamples[0]) should correspond to
+        // baseFrameIndex - (NUM_TAPS/2 - 1).
+        int32_t kernelStartFrameIndex = baseFrameIndex - (NUM_TAPS / 2 - 1);
 
         for (int ch_out = 0; ch_out < outputStreamChannels; ++ch_out) {
-            int srcChannel = ch_out % channels;
-            float p0 = getSampleAt(p1_idx - 1, srcChannel); float p1 = getSampleAt(p1_idx, srcChannel);
-            float p2 = getSampleAt(p1_idx + 1, srcChannel); float p3 = getSampleAt(p1_idx + 2, srcChannel);
-            outputBuffer[i * outputStreamChannels + ch_out] += catmullRomInterpolate(p0, p1, p2, p3, t) * effectiveVolume;
+            int srcChannel = ch_out % channels; // Handle mono-to-stereo, etc.
+            float interpolatedSample = 0.0f;
+
+            // Collect samples for the convolution
+            // This loop can be optimized by fetching all NUM_TAPS samples first if beneficial
+            // but direct use of getSampleAt handles boundaries per sample.
+            for (int k = 0; k < NUM_TAPS; ++k) {
+                float sampleValue = getSampleAt(kernelStartFrameIndex + k, srcChannel);
+                interpolatedSample += sampleValue * coefficients[k];
+            }
+            outputBuffer[i * outputStreamChannels + ch_out] += interpolatedSample * effectiveVolume;
         }
         localPreciseCurrentFrame += playbackRateToUse;
     }

@@ -35,6 +35,7 @@ class AppViewModel( // This should be the only declaration of this class in this
         private set
     var showSettingsDialog by mutableStateOf(false)
         private set
+    var showSubscribePopup by mutableStateOf(false) // Added for premium feature popup
 
     // --- Platter and Vinyl Mechanics ---
     var visualPlatterAngle by mutableFloatStateOf(0f)
@@ -151,8 +152,13 @@ class AppViewModel( // This should be the only declaration of this class in this
 
     fun handleButton1Hold() {
         Log.i("AppViewModel_Button1", "handleButton1Hold() CALLED")
-        Log.d("AppViewModel_Button1", "Button 1 Hold: Request User Platter Sample Upload (Placeholder)")
-        // onLoadUserPlatterSample("path/to/user/sample") // Example
+        if (MainActivity.isCurrentUserPremium) {
+            Log.d("AppViewModel_Button1", "Premium user: Triggering user platter sample loading (placeholder).")
+            // onLoadUserPlatterSample("path/to/user/sample") // Example - premium feature
+        } else {
+            Log.d("AppViewModel_Button1", "Non-premium user: Showing subscribe popup.")
+            showSubscribePopup = true
+        }
     }
 
     fun handleButton2Press() {
@@ -186,8 +192,13 @@ class AppViewModel( // This should be the only declaration of this class in this
 
     fun handleButton2Hold() {
         Log.i("AppViewModel_Button2", "handleButton2Hold() CALLED")
-        Log.d("AppViewModel_Button2", "Button 2 Hold: Request User Music Track Upload (Placeholder)")
-        // onLoadUserMusicTrack("path/to/user/track") // Example
+        if (MainActivity.isCurrentUserPremium) {
+            Log.d("AppViewModel_Button2", "Premium user: Triggering user music track loading (placeholder).")
+            // onLoadUserMusicTrack("path/to/user/track") // Example - premium feature
+        } else {
+            Log.d("AppViewModel_Button2", "Non-premium user: Showing subscribe popup.")
+            showSubscribePopup = true
+        }
     }
 
     fun handleHoldBothButtons() {

@@ -1,6 +1,8 @@
 // File: com/example/fromscratch/AppUI.kt
 package com.example.fromscratch
 
+import android.content.Intent
+import android.net.Uri
 import android.util.Log
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -26,6 +28,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.style.TextAlign
@@ -41,6 +44,8 @@ import kotlin.math.pow
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
+// Explicitly import MainActivity
+import com.example.fromscratch.MainActivity
 import androidx.constraintlayout.compose.ConstraintLayout
 import androidx.constraintlayout.compose.Dimension
 
@@ -61,6 +66,9 @@ fun DjApp(viewModel: AppViewModel) {
                     viewModel = viewModel,
                     onDismiss = { viewModel.closeSettingsDialog() }
                 )
+            }
+            if (viewModel.showSubscribePopup) {
+                SubscribePopup(viewModel = viewModel, paymentUrl = MainActivity.PAYMENT_URL)
             }
         }
     }
@@ -102,6 +110,37 @@ fun LoadingScreen(viewModel: AppViewModel?) {
                 .padding(bottom = 24.dp)
         )
     }
+}
+
+@Composable
+fun SubscribePopup(viewModel: AppViewModel, paymentUrl: String) {
+    val context = LocalContext.current
+    AlertDialog(
+        onDismissRequest = { viewModel.showSubscribePopup = false },
+        title = { Text("Premium Feature") },
+        text = { Text("Subscribe to unlock this feature and more!") },
+        confirmButton = {
+            TextButton(
+                onClick = {
+                    viewModel.showSubscribePopup = false
+                    val intent = Intent(Intent.ACTION_VIEW, Uri.parse(paymentUrl))
+                    context.startActivity(intent)
+                }
+            ) {
+                Text("Subscribe")
+            }
+        },
+        dismissButton = {
+            TextButton(
+                onClick = { viewModel.showSubscribePopup = false }
+            ) {
+                Text("Later")
+            }
+        },
+        containerColor = Color(0xFF333333), // Similar to SettingsDialog
+        titleContentColor = Color.White,
+        textContentColor = Color.White
+    )
 }
 
 @Composable
@@ -384,6 +423,27 @@ fun PlatterView(
     }
 }
 
+@Preview(showBackground = true)
+@Composable
+fun SubscribePopupPreview() {
+    MaterialTheme {
+        val dummyAppViewModel = AppViewModel(
+            onPlayIntroAndLoopOnPlatter = {}, onNextPlatterSample = {}, onLoadUserPlatterSample = {},
+            onPlayMusicTrack = {}, onStopMusicTrack = {}, onNextMusicTrackAndPlay = {},
+            onNextMusicTrackAndKeepState = {}, onLoadUserMusicTrack = {},
+            onUpdatePlatterFaderVolume = {}, onUpdateMusicMasterVolume = {},
+            onScratchPlatterActive = { _, _ -> }, onReleasePlatterTouch = {},
+            onUpdateScratchSensitivity = {},
+            onSetAudioNormalizationFactor = {} // Added this to match constructor
+        )
+        dummyAppViewModel.showSubscribePopup = true // To make the popup visible in preview
+        // Simulate the dark background that DjApp would provide if a dialog is shown
+        Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.6f)), contentAlignment = Alignment.Center) {
+            SubscribePopup(viewModel = dummyAppViewModel, paymentUrl = "https://example.com/subscribe_preview")
+        }
+    }
+}
+
 @Composable
 fun SettingsDialog(
     viewModel: AppViewModel,
@@ -452,6 +512,29 @@ fun SettingsDialog(
                 Text("Lower: Less sensitive | Higher: More sensitive", color = Color.Gray, fontSize = 10.sp)
 
                 Spacer(modifier = Modifier.height(16.dp))
+
+                // --- Premium Features Switch ---
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "Enable Premium Features (Dev)",
+                        color = Color.White,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Switch(
+                        checked = MainActivity.isCurrentUserPremium,
+                        onCheckedChange = { MainActivity.isCurrentUserPremium = it },
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor = MaterialTheme.colorScheme.primary,
+                            // uncheckedThumbColor = Color.Gray // Example for unchecked
+                        )
+                    )
+                }
+                Spacer(modifier = Modifier.height(8.dp))
+                // --- End Premium Features Switch ---
+
                 Button(
                     onClick = onDismiss,
                     colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF555555))
@@ -474,7 +557,8 @@ fun SettingsDialogPreview() {
             onNextMusicTrackAndKeepState = {}, onLoadUserMusicTrack = {},
             onUpdatePlatterFaderVolume = {}, onUpdateMusicMasterVolume = {},
             onScratchPlatterActive = { _, _ -> }, onReleasePlatterTouch = {},
-            onUpdateScratchSensitivity = {}
+            onUpdateScratchSensitivity = {},
+            onSetAudioNormalizationFactor = {} // Added to satisfy constructor
         )
         Box(Modifier.fillMaxSize().background(Color.Gray.copy(alpha = 0.5f)), contentAlignment = Alignment.Center) {
             SettingsDialog(
@@ -495,7 +579,8 @@ fun MainScreenPreview() {
             onPlayMusicTrack = {}, onStopMusicTrack = {}, onNextMusicTrackAndPlay = {}, onNextMusicTrackAndKeepState = {}, onLoadUserMusicTrack = {},
             onUpdatePlatterFaderVolume = {}, onUpdateMusicMasterVolume = {},
             onScratchPlatterActive = { _, _ -> }, onReleasePlatterTouch = {},
-            onUpdateScratchSensitivity = {}
+            onUpdateScratchSensitivity = {},
+            onSetAudioNormalizationFactor = {} // Added to satisfy constructor
         )
         MainScreen(viewModel = dummyAppViewModel)
     }

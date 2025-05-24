@@ -13,6 +13,9 @@ import androidx.activity.viewModels
 class MainActivity : ComponentActivity() {
 
     companion object {
+        var isCurrentUserPremium: Boolean = false
+        const val PAYMENT_URL: String = "https://www.example.com/subscribe"
+
         init {
             try {
                 System.loadLibrary("scratch-emulator-lib")

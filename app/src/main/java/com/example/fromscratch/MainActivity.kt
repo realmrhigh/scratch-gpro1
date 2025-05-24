@@ -13,6 +13,9 @@ import androidx.activity.viewModels
 class MainActivity : ComponentActivity() {
 
     companion object {
+        var isCurrentUserPremium: Boolean = false
+        const val PAYMENT_URL: String = "https://www.example.com/subscribe"
+
         init {
             try {
                 System.loadLibrary("scratch-emulator-lib")
@@ -41,7 +44,8 @@ class MainActivity : ComponentActivity() {
     private external fun setMusicMasterVolume(volume: Float)
     private external fun scratchPlatterActive(isActive: Boolean, angleDeltaOrRate: Float)
     private external fun releasePlatterTouch()
-    private external fun setScratchSensitivity(sensitivity: Float) // NEW JNI function
+    private external fun setScratchSensitivity(sensitivity: Float) 
+    private external fun setAudioNormalizationFactor(degreesPerFrame: Float) // New JNI declaration
 
     private val appViewModel: AppViewModel by viewModels {
         AppViewModelFactory(this)
@@ -74,9 +78,13 @@ class MainActivity : ComponentActivity() {
                         activity.scratchPlatterActive(isActive, angleDeltaOrRate)
                     },
                     onReleasePlatterTouch = { activity.releasePlatterTouch() },
-                    onUpdateScratchSensitivity = { sensitivity -> // NEW: Connect to JNI
+                    onUpdateScratchSensitivity = { sensitivity ->
                         Log.d("MainActivity", "VM -> JNI: setScratchSensitivity($sensitivity)")
                         activity.setScratchSensitivity(sensitivity)
+                    },
+                    onSetAudioNormalizationFactor = { degrees -> // New lambda for ViewModelFactory
+                        Log.d("MainActivity", "VM -> JNI: setAudioNormalizationFactor($degrees)")
+                        activity.setAudioNormalizationFactor(degrees)
                     }
                 ) as T
             }

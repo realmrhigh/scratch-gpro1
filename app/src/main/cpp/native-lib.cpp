@@ -3,9 +3,19 @@
 #include <vector>
 #include <memory>
 #include <atomic>
-#include <cmath> // For std::fabs, fmodf, floor
+#include <cmath> // For std::fabs, fmodf, floor, std::cyl_bessel_i (potentially with C++17, but provide fallback)
 #include <algorithm> // For std::clamp, std::min, std::transform, std::max
 #include <android/log.h>
+
+// Define M_PI if not already defined (common in cmath but not guaranteed by standard before C++20)
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+// Sinc Interpolation Parameters
+constexpr int NUM_TAPS = 16; // Number of points for interpolation
+constexpr int SUBDIVISION_STEPS = 1024; // Number of fractional offsets to pre-calculate
+constexpr double KAISER_BETA = 6.0;
 #include <android/asset_manager_jni.h> // For AAssetManager_fromJava
 #include <oboe/Oboe.h>
 #include <oboe/Utilities.h> // For oboe::convertToText
@@ -37,6 +47,14 @@ struct AudioSample {
     AudioEngine* audioEnginePtr = nullptr;
     std::atomic<bool> useEngineRateForPlayback_{false};
 
+    // Sinc table
+    static std::vector<std::vector<float>> sincTable;
+    static bool sincTableInitialized;
+    static void precalculateSincTable();
+    static double bessel_i0_approx(double x);
+    static double kaiserWindow(double n_rel, double N_total_taps, double beta);
+
+
     bool hasExtension(const std::string& path, const std::string& extension);
     bool tryLoadPath(AAssetManager* assetManager, const std::string& currentPathToTry);
     void load(AAssetManager* assetManager, const std::string& basePath, AudioEngine* engine);
@@ -66,17 +84,122 @@ struct AudioSample {
         return 0.0f;
     }
 
-    inline float catmullRomInterpolate(float p0, float p1, float p2, float p3, float t) const {
-        float t2 = t * t; float t3 = t2 * t;
-        return 0.5f * ((2.0f * p1) + (-p0 + p2) * t + (2.0f * p0 - 5.0f * p1 + 4.0f * p2 - p3) * t2 + (-p0 + 3.0f * p1 - 3.0f * p2 + p3) * t3);
-    }
+    // inline float catmullRomInterpolate(float p0, float p1, float p2, float p3, float t) const {
+    //     float t2 = t * t; float t3 = t2 * t;
+    //     return 0.5f * ((2.0f * p1) + (-p0 + p2) * t + (2.0f * p0 - 5.0f * p1 + 4.0f * p2 - p3) * t2 + (-p0 + 3.0f * p1 - 3.0f * p2 + p3) * t3);
+    // }
 };
+// Static member initialization
+std::vector<std::vector<float>> AudioSample::sincTable;
+bool AudioSample::sincTableInitialized = false;
+
+// Bessel function I0 approximation - using a common polynomial approximation
+// Valid for -3.75 <= x <= 3.75. For Kaiser, argument to I0 is beta * sqrt(1 - (term)^2), term is [-1,1]
+// So argument is [0, beta]. If beta is e.g. 6, this range is fine.
+// For x > 3.75, another approximation or asymptotic series would be needed, but for typical beta values, this is often sufficient.
+// Let's use a more general one from Numerical Recipes (approximation for I0(x))
+double AudioSample::bessel_i0_approx(double x) {
+    double ax = std::abs(x);
+    if (ax < 3.75) {
+        double y = x / 3.75;
+        y *= y;
+        return 1.0 + y * (3.5156229 + y * (3.0899424 + y * (1.2067492 + y * (0.2659732 + y * (0.0360768 + y * 0.0045813)))));
+    } else {
+        double y = 3.75 / ax;
+        return (std::exp(ax) / std::sqrt(ax)) * (0.39894228 + y * (0.01328592 + y * (0.00225319 + y * (-0.00157565 + y * (0.00916281 + y * (-0.02057706 + y * (0.02635537 + y * (-0.01647633 + y * 0.00392377))))))));
+    }
+}
+
+// n_rel: current sample index relative to the window center: 0 for center, +/- (N/2 -1) for edges
+// N_total_taps: total number of taps in the window
+double AudioSample::kaiserWindow(double n_rel_to_center, double N_total_taps, double beta) {
+    if (std::abs(n_rel_to_center) > (N_total_taps / 2.0 - 0.5) && N_total_taps > 1) { // check if n is outside the window span for N>1
+         // Should not happen if sincPoint is correctly calculated relative to window span
+        return 0.0; // Outside the window
+    }
+    // Argument for Kaiser window: (2.0 * n_abs_from_zero_indexed_start / (N_total_taps - 1)) - 1.0
+    // where n_abs_from_zero_indexed_start goes from 0 to N_total_taps-1
+    // If n_rel_to_center is - (N/2 - 1) ... 0 ... (N/2 - 1)
+    // then n_zero_indexed = n_rel_to_center + (N/2 -1)
+    // (2.0 * (n_rel_to_center + (N_total_taps/2.0 -1.0) ) / (N_total_taps -1.0) ) - 1.0
+    // This term inside sqrt: ( (2.0*n_idx_from_start) / (N-1) ) - 1.0; where n_idx_from_start is 0 to N-1
+    // Let's use a simpler formulation: term = n_rel_to_center / (N_total_taps/2.0)
+    // This makes 'term' go from -1 to 1 across the main lobe (approx)
+    double term_val_for_bessel_arg;
+    if (N_total_taps <= 1) term_val_for_bessel_arg = 0.0; // Single tap window is always 1.0
+    else term_val_for_bessel_arg = (2.0 * (n_rel_to_center + (N_total_taps/2.0 - 0.5)) / (N_total_taps - 1.0)) - 1.0;
+
+
+    double val_inside_sqrt = 1.0 - term_val_for_bessel_arg * term_val_for_bessel_arg;
+    if (val_inside_sqrt < 0) val_inside_sqrt = 0; // Clamp due to precision
+
+    return bessel_i0_approx(beta * std::sqrt(val_inside_sqrt)) / bessel_i0_approx(beta);
+}
+
+
+void AudioSample::precalculateSincTable() {
+    if (sincTableInitialized) return;
+
+    sincTable.resize(SUBDIVISION_STEPS, std::vector<float>(NUM_TAPS));
+    double I0_beta = bessel_i0_approx(KAISER_BETA); // Denominator for Kaiser window
+
+    for (int j = 0; j < SUBDIVISION_STEPS; ++j) {
+        double fractionalOffset = static_cast<double>(j) / SUBDIVISION_STEPS;
+
+        float sumCoeffs = 0.0f; // For normalization
+
+        for (int i = 0; i < NUM_TAPS; ++i) {
+            // sincPoint: distance from the tap 'i' to the desired interpolation point (fractionalOffset)
+            // The center of the NUM_TAPS samples is between tap NUM_TAPS/2 - 1 and NUM_TAPS/2.
+            // We want the filter kernel to be centered such that when fractionalOffset is 0,
+            // the interpolated point corresponds to the sample at index (NUM_TAPS/2 - 1) in the input kernel.
+            // Or, if we consider the "ideal" sample to be at `fractionalOffset` relative to `input_kernel[NUM_TAPS/2 -1]`.
+            // Let the current tap be `i`. Its position relative to the *start of the window* is `i`.
+            // The point we are interpolating *to* is `(NUM_TAPS/2 - 1) + fractionalOffset`.
+            // So, distance from tap `i` to this point is `i - ((NUM_TAPS/2 - 1) + fractionalOffset)`.
+            // Or, `( (double)i - (NUM_TAPS/2.0 - 1.0) ) - fractionalOffset` seems common.
+            // This makes `sincPoint` centered around `fractionalOffset`.
+            // If `i` is `NUM_TAPS/2 -1`, then `sincPoint = -fractionalOffset`.
+            // If `i` is `NUM_TAPS/2`, then `sincPoint = 1 - fractionalOffset`.
+            double sincPoint = (static_cast<double>(i) - (NUM_TAPS / 2.0 - 1.0)) - fractionalOffset;
+
+            double sincValue;
+            if (std::abs(sincPoint) < 1e-9) { // Check for sincPoint == 0
+                sincValue = 1.0;
+            } else {
+                sincValue = std::sin(M_PI * sincPoint) / (M_PI * sincPoint);
+            }
+
+            // For Kaiser window, 'n_rel' is distance from center of the window.
+            // Window is indexed 0 to NUM_TAPS-1. Center is at (NUM_TAPS-1)/2.0.
+            // So, n_rel = i - (NUM_TAPS-1)/2.0
+            double kaiser_n_rel = static_cast<double>(i) - (NUM_TAPS - 1.0) / 2.0;
+            double windowValue = kaiserWindow(kaiser_n_rel, NUM_TAPS, KAISER_BETA);
+            // The original kaiserWindow helper used n_rel_to_center directly, this is fine.
+            // double windowValue = kaiserWindow( (double)i - (NUM_TAPS/2.0 -1.0) , NUM_TAPS, KAISER_BETA); // This was less clear
+
+            sincTable[j][i] = static_cast<float>(sincValue * windowValue);
+            sumCoeffs += sincTable[j][i];
+        }
+
+        // Normalize coefficients to sum to 1.0 to ensure gain is preserved
+        if (std::abs(sumCoeffs) > 1e-6) { // Avoid division by zero if all coeffs are zero
+            for (int i = 0; i < NUM_TAPS; ++i) {
+                sincTable[j][i] /= sumCoeffs;
+            }
+        }
+    }
+    sincTableInitialized = true;
+    ALOGI("Sinc table precalculated: %d steps, %d taps. Beta: %f", SUBDIVISION_STEPS, NUM_TAPS, KAISER_BETA);
+}
+
 
 class AudioEngine : public oboe::AudioStreamCallback {
 public:
     std::atomic<float> platterTargetPlaybackRate_{1.0f};
     std::atomic<float> scratchSensitivity_{0.17f};
     const float MOVEMENT_THRESHOLD = 0.001f;
+    float degreesPerFrameForUnityRate_ = 2.5f; // Default, will be updated from Kotlin
 
     AudioEngine() : appAssetManager_(nullptr), streamSampleRate_(0) {
         ALOGI("AudioEngine default constructor.");
@@ -113,10 +236,21 @@ public:
         scratchSensitivity_.store(sensitivity);
         ALOGE("AudioEngine: CONFIRMED scratchSensitivity_ (member) is now %.4f after store", scratchSensitivity_.load());
     }
+    void setDegreesPerFrameForUnityRateInternal(float degrees) {
+        if (degrees > 0.0f) { // Basic validation
+            degreesPerFrameForUnityRate_ = degrees;
+            ALOGI("AudioEngine: degreesPerFrameForUnityRate_ set to %.4f", degreesPerFrameForUnityRate_);
+        } else {
+            ALOGE("AudioEngine: Invalid degreesPerFrameForUnityRate_ value: %.4f", degrees);
+        }
+    }
 
     oboe::DataCallbackResult onAudioReady(oboe::AudioStream* stream, void* audioData, int32_t numFrames) override;
     void onErrorBeforeClose(oboe::AudioStream *stream, oboe::Result error) override;
     void onErrorAfterClose(oboe::AudioStream *stream, oboe::Result error) override;
+
+    // Getter for isFingerDownOnPlatter_
+    bool isPlatterTouched() const { return isFingerDownOnPlatter_.load(); }
 
 private:
     std::shared_ptr<oboe::AudioStream> audioStream_;
@@ -172,6 +306,9 @@ bool AudioSample::tryLoadPath(AAssetManager* assetManager, const std::string& cu
 }
 
 void AudioSample::load(AAssetManager* assetManager, const std::string& basePath, AudioEngine* engine) {
+    if (!sincTableInitialized) { // Ensure table is calculated, typically once per app run or if params change
+        precalculateSincTable();
+    }
     this->audioEnginePtr = engine; ALOGI("AudioSample: Attempting to load base path: %s", basePath.c_str());
     isPlaying.store(false); preciseCurrentFrame.store(0.0f); useEngineRateForPlayback_.store(false);
     playedOnce = false; loop.store(false); playOnceThenLoopSilently = false;
@@ -199,8 +336,13 @@ void AudioSample::load(AAssetManager* assetManager, const std::string& basePath,
 
 void AudioSample::getAudio(float* outputBuffer, int32_t numOutputFrames, int32_t outputStreamChannels,
                            float effectiveVolume) {
-    if (!isPlaying.load() || audioData.empty() || totalFrames == 0 || channels == 0) {
-        return;
+    bool doLog = false;
+    bool isPlatterTouched_engine = false;
+    if (audioEnginePtr != nullptr) {
+        isPlatterTouched_engine = audioEnginePtr->isPlatterTouched();
+        if (isPlatterTouched_engine) {
+            doLog = true;
+        }
     }
 
     float localPreciseCurrentFrame = preciseCurrentFrame.load();
@@ -208,35 +350,116 @@ void AudioSample::getAudio(float* outputBuffer, int32_t numOutputFrames, int32_t
 
     if (useEngineRateForPlayback_.load() && audioEnginePtr != nullptr) {
         playbackRateToUse = audioEnginePtr->platterTargetPlaybackRate_.load();
-        if (std::fabs(playbackRateToUse) < 0.00001f) {
-            return;
-        }
     }
 
-    float frameAtLoopStart = localPreciseCurrentFrame;
+    if (doLog) {
+        // Variables for logging, matching the requested items
+        const char* log_filePath = this->filePath.c_str(); // Item 1
+        float log_initialFrame = localPreciseCurrentFrame;    // Item 2
+        bool log_isPlaying = isPlaying.load();              // Item 3
+        bool log_useEngineRate = useEngineRateForPlayback_.load(); // Item 4
+        bool log_enginePtrValid = (audioEnginePtr != nullptr); // Item 5
+        // Item 6a (isPlatterTouched_engine) is already available
+        float log_enginePlatterRate = -1.0f; // Item 6b (placeholder if not applicable)
+        if (log_useEngineRate && audioEnginePtr != nullptr) {
+            log_enginePlatterRate = audioEnginePtr->platterTargetPlaybackRate_.load();
+        }
+        // Item 7 (playbackRateToUse) is already available
+        int log_totalFrames = this->totalFrames; // For context
 
+        ALOGV("AudioSample::getAudio[%s] FingerDown:%d - StartFrame:%.2f, isPlaying:%d, useEngineRate:%d, enginePtrValid:%d, enginePlatterRate:%.2f, finalPlaybackRate:%.2f, totalFrames:%d",
+              log_filePath,
+              isPlatterTouched_engine, // This is the direct result of audioEnginePtr->isPlatterTouched()
+              log_initialFrame,
+              log_isPlaying,
+              log_useEngineRate,
+              log_enginePtrValid,
+              log_enginePlatterRate,
+              playbackRateToUse,
+              log_totalFrames);
+    }
+
+    // Standard checks for playability
+    if (!isPlaying.load() || audioData.empty() || totalFrames == 0 || channels == 0) {
+        if (doLog) { // Log if returning early during a finger-down scenario
+            ALOGV("AudioSample::getAudio[%s] FingerDown:%d - RETURNING EARLY. isPlaying:%d, audioEmpty:%d, totalFrames:%d, channels:%d. Frame:%.2f",
+                  this->filePath.c_str(), isPlatterTouched_engine, isPlaying.load(), audioData.empty(), totalFrames, channels, localPreciseCurrentFrame);
+        }
+        return;
+    }
+
+    // Main processing loop
+    // localPreciseCurrentFrame will be modified within this loop
     for (int i = 0; i < numOutputFrames; ++i) {
+        if (!isPlaying.load()) {
+            if (doLog) ALOGV("AudioSample::getAudio[%s] FingerDown:%d - Loop iter %d: Breaking loop, isPlaying is false. Frame: %.2f", this->filePath.c_str(), isPlatterTouched_engine, i, localPreciseCurrentFrame);
+            break;
+        }
+
+        // Boundary logic
         if (localPreciseCurrentFrame >= static_cast<float>(totalFrames) || localPreciseCurrentFrame < 0.0f) {
             if (playOnceThenLoopSilently && !playedOnce) {
+                if (doLog) ALOGV("AudioSample::getAudio[%s] FingerDown:%d - Loop iter %d: playOnceThenLoopSilently path. Frame: %.2f", this->filePath.c_str(), isPlatterTouched_engine, i, localPreciseCurrentFrame);
                 playedOnce = true; localPreciseCurrentFrame = 0.0f;
                 if (!loop.load()) loop.store(true);
             } else if (loop.load()) {
                 if (totalFrames > 0) {
+                    if (doLog && (localPreciseCurrentFrame >= static_cast<float>(totalFrames) || localPreciseCurrentFrame < 0.0f)) {
+                         ALOGV("AudioSample::getAudio[%s] FingerDown:%d - Loop iter %d: Looping frame. Before: %.2f", this->filePath.c_str(), isPlatterTouched_engine, i, localPreciseCurrentFrame);
+                    }
                     localPreciseCurrentFrame = fmodf(localPreciseCurrentFrame, static_cast<float>(totalFrames));
                     if (localPreciseCurrentFrame < 0.0f) localPreciseCurrentFrame += static_cast<float>(totalFrames);
-                } else localPreciseCurrentFrame = 0.0f;
-            } else { isPlaying.store(false); break; }
+                    if (doLog && (localPreciseCurrentFrame >= static_cast<float>(totalFrames) || localPreciseCurrentFrame < 0.0f)) { // Should ideally not happen after correction
+                         ALOGV("AudioSample::getAudio[%s] FingerDown:%d - Loop iter %d: Looping frame. After: %.2f", this->filePath.c_str(), isPlatterTouched_engine, i, localPreciseCurrentFrame);
+                    }
+                } else {
+                     localPreciseCurrentFrame = 0.0f;
+                }
+            } else { // Not looping, and beyond boundaries
+                if (doLog) ALOGV("AudioSample::getAudio[%s] FingerDown:%d - Loop iter %d: End of non-looping sample. Setting isPlaying=false. Frame: %.2f", this->filePath.c_str(), isPlatterTouched_engine, i, localPreciseCurrentFrame);
+                isPlaying.store(false);
+                break; 
+            }
         }
-        if (!isPlaying.load()) break;
+        
+        if (!isPlaying.load()) { // Re-check after boundary logic might have changed isPlaying
+             if (doLog) ALOGV("AudioSample::getAudio[%s] FingerDown:%d - Loop iter %d: Breaking loop (post-boundary logic), isPlaying is false. Frame: %.2f", this->filePath.c_str(), isPlatterTouched_engine, i, localPreciseCurrentFrame);
+             break;
+        }
 
-        float t = localPreciseCurrentFrame - std::floor(localPreciseCurrentFrame);
-        int32_t p1_idx = static_cast<int32_t>(std::floor(localPreciseCurrentFrame));
+        float fractionalTime = localPreciseCurrentFrame - std::floor(localPreciseCurrentFrame);
+        int32_t baseFrameIndex = static_cast<int32_t>(std::floor(localPreciseCurrentFrame));
+
+        // Determine index for sincTable lookup
+        int sincTableIndex = static_cast<int>(fractionalTime * SUBDIVISION_STEPS);
+        sincTableIndex = std::min(sincTableIndex, SUBDIVISION_STEPS - 1); // Clamp to max index
+
+        const std::vector<float>& coefficients = sincTable[sincTableIndex];
+
+        // Calculate start index for fetching samples for the convolution kernel
+        // The kernel is centered around a point "just before" baseFrameIndex if fractionalTime is 0.
+        // More precisely, for fractionalTime = 0, we want the output to be as close as possible
+        // to the sample at baseFrameIndex.
+        // The coefficients are indexed 0 to NUM_TAPS-1.
+        // If fractionalTime = 0, sincPoint for tap i is (i - (NUM_TAPS/2 - 1)).
+        // The peak of the sinc function (sincPoint=0) is when i = NUM_TAPS/2 - 1.
+        // So, coefficients[NUM_TAPS/2 - 1] should be multiplied by sample at baseFrameIndex.
+        // Thus, the first sample in our local kernel (kernelSamples[0]) should correspond to
+        // baseFrameIndex - (NUM_TAPS/2 - 1).
+        int32_t kernelStartFrameIndex = baseFrameIndex - (NUM_TAPS / 2 - 1);
 
         for (int ch_out = 0; ch_out < outputStreamChannels; ++ch_out) {
-            int srcChannel = ch_out % channels;
-            float p0 = getSampleAt(p1_idx - 1, srcChannel); float p1 = getSampleAt(p1_idx, srcChannel);
-            float p2 = getSampleAt(p1_idx + 1, srcChannel); float p3 = getSampleAt(p1_idx + 2, srcChannel);
-            outputBuffer[i * outputStreamChannels + ch_out] += catmullRomInterpolate(p0, p1, p2, p3, t) * effectiveVolume;
+            int srcChannel = ch_out % channels; // Handle mono-to-stereo, etc.
+            float interpolatedSample = 0.0f;
+
+            // Collect samples for the convolution
+            // This loop can be optimized by fetching all NUM_TAPS samples first if beneficial
+            // but direct use of getSampleAt handles boundaries per sample.
+            for (int k = 0; k < NUM_TAPS; ++k) {
+                float sampleValue = getSampleAt(kernelStartFrameIndex + k, srcChannel);
+                interpolatedSample += sampleValue * coefficients[k];
+            }
+            outputBuffer[i * outputStreamChannels + ch_out] += interpolatedSample * effectiveVolume;
         }
         localPreciseCurrentFrame += playbackRateToUse;
     }
@@ -519,63 +742,82 @@ void AudioEngine::setMusicMasterVolumeInternal(float volume) {
 
 // MODIFIED: Logic to handle coasting rates and isPlaying state
 void AudioEngine::scratchPlatterActiveInternal(bool isActiveTouch, float angleDeltaOrRateFromViewModel) {
+    // Log 1: Input parameters
+    ALOGV("AudioEngine::scratchPlatterActiveInternal - Input: isActiveTouch:%d, angleDeltaOrRate:%.4f", isActiveTouch, angleDeltaOrRateFromViewModel);
+
     isFingerDownOnPlatter_.store(isActiveTouch);
 
     if (!platterAudioSample_ || platterAudioSample_->totalFrames == 0) {
         if(isActiveTouch) ALOGW("ScratchPlatterActive: Attempt on unloaded/invalid platter sample.");
-        if(platterAudioSample_) platterAudioSample_->useEngineRateForPlayback_.store(false);
+        if(platterAudioSample_) { 
+            platterAudioSample_->useEngineRateForPlayback_.store(false);
+            // Log 3 & 4 for early exit path, using the specified format
+            ALOGV("AudioEngine::scratchPlatterActiveInternal - PlatterSample State: useEngineRate:%d, isPlaying:%d", platterAudioSample_->useEngineRateForPlayback_.load(), platterAudioSample_->isPlaying.load());
+        }
         return;
     }
 
     platterAudioSample_->useEngineRateForPlayback_.store(true);
+    // Log 3 & 4 after setting useEngineRateForPlayback_, using the specified format
+    ALOGV("AudioEngine::scratchPlatterActiveInternal - PlatterSample State: useEngineRate:%d, isPlaying:%d", platterAudioSample_->useEngineRateForPlayback_.load(), platterAudioSample_->isPlaying.load());
+    
     float targetAudioRate;
     float currentSensitivity = scratchSensitivity_.load();
 
-    ALOGE("ScratchPlatterActive INPUT: isActiveTouch: %d, angleDeltaOrRateFromVM: %.4f, ACTUAL currentSensitivity_ LOADED: %.4f",
+    // This ALOGE was for specific debugging by the user, kept as ALOGE.
+    ALOGE("ScratchPlatterActive INPUT (Detail): isActiveTouch: %d, angleDeltaOrRateFromVM: %.4f, Sensitivity: %.4f",
           isActiveTouch, angleDeltaOrRateFromViewModel, currentSensitivity);
 
     if (isActiveTouch) { // Finger is actively interacting (touch down or drag)
         if (std::fabs(angleDeltaOrRateFromViewModel) > MOVEMENT_THRESHOLD) { // Finger is moving
-            targetAudioRate = angleDeltaOrRateFromViewModel * currentSensitivity;
+            // targetAudioRate = angleDeltaOrRateFromViewModel * currentSensitivity; // Old logic
+            float normalizedInputRate = 0.0f;
+            if (std::fabs(degreesPerFrameForUnityRate_) > 0.00001f) { // Avoid division by zero
+                normalizedInputRate = angleDeltaOrRateFromViewModel / degreesPerFrameForUnityRate_;
+            } else if (std::fabs(angleDeltaOrRateFromViewModel) > 0.00001f) {
+                 // If degreesPerFrameForUnityRate_ is zero but there's movement,
+                 // this is an undefined state, but use sensitivity directly as a fallback to avoid silence.
+                normalizedInputRate = angleDeltaOrRateFromViewModel;
+            }
+            targetAudioRate = normalizedInputRate * currentSensitivity;
+
             targetAudioRate = std::clamp(targetAudioRate, -4.0f, 4.0f);
             if (!platterAudioSample_->isPlaying.load()) {
-                ALOGV("Scratch Move: angleDelta: %.2f, currentSensitivity: %.4f, target rate: %.4f. Setting isPlaying=true.",
-                      angleDeltaOrRateFromViewModel, currentSensitivity, targetAudioRate);
                 platterAudioSample_->isPlaying.store(true);
-            } else {
-                ALOGV("Scratch Move: angleDelta: %.2f, currentSensitivity: %.4f, target rate: %.4f. isPlaying already true.",
-                      angleDeltaOrRateFromViewModel, currentSensitivity, targetAudioRate);
             }
-        } else { // Finger is down, but not moving (angleDeltaOrRateFromViewModel is 0 from onPlatterTouchDown)
+        } else { // Finger is down, but not moving
             targetAudioRate = 0.0f;
             if (platterAudioSample_->isPlaying.load()) {
-                ALOGV("Scratch Hold: No significant movement. Setting isPlaying=false. Target rate: %.4f", targetAudioRate);
                 platterAudioSample_->isPlaying.store(false);
-            } else {
-                ALOGV("Scratch Hold: Already silent or becoming silent. Target rate: %.4f", targetAudioRate);
             }
         }
-    } else { // Finger is NOT on platter (isActiveTouch is false), ViewModel is sending a coasting/damped rate
-        targetAudioRate = angleDeltaOrRateFromViewModel; // This is the desired normalized audio rate
-        ALOGV("Coasting/NotTouched: Received rate from ViewModel: %.4f", targetAudioRate);
+        // Log 3 & 4 after potential modifications in isActiveTouch=true branch, using the specified format
+        ALOGV("AudioEngine::scratchPlatterActiveInternal - PlatterSample State: useEngineRate:%d, isPlaying:%d", platterAudioSample_->useEngineRateForPlayback_.load(), platterAudioSample_->isPlaying.load());
 
-        // If coasting rate is non-zero, audio should be playing.
-        // If coasting rate becomes zero (vinyl has stopped), audio should stop.
-        if (std::fabs(targetAudioRate) > 0.00001f) {
+    } else { // Finger is NOT on platter (isActiveTouch is false)
+        targetAudioRate = angleDeltaOrRateFromViewModel; // This is the desired normalized audio rate
+        
+        if (std::fabs(targetAudioRate) > 0.00001f) { // If coasting rate is non-zero
             if(!platterAudioSample_->isPlaying.load()) {
-                ALOGV("Coasting: Rate: %.4f. Setting isPlaying=true.", targetAudioRate);
                 platterAudioSample_->isPlaying.store(true);
             }
-        } else {
+        } else { // Coasting rate is effectively zero
             if(platterAudioSample_->isPlaying.load()) {
-                ALOGV("Coasting: Rate is effectively zero (%.4f). Setting isPlaying=false.", targetAudioRate);
                 platterAudioSample_->isPlaying.store(false);
             }
         }
+        // Log 3 & 4 after potential modifications in isActiveTouch=false branch, using the specified format
+        ALOGV("AudioEngine::scratchPlatterActiveInternal - PlatterSample State: useEngineRate:%d, isPlaying:%d", platterAudioSample_->useEngineRateForPlayback_.load(), platterAudioSample_->isPlaying.load());
     }
+
+    // Log 2: Calculated targetAudioRate before storing
+    ALOGV("AudioEngine::scratchPlatterActiveInternal - Calculated: targetAudioRate:%.4f", targetAudioRate);
     platterTargetPlaybackRate_.store(targetAudioRate);
-    ALOGV("scratchPlatterActiveInternal END: Final platterTargetPlaybackRate_ set to: %.4f, isPlaying: %d",
-          targetAudioRate, (platterAudioSample_ ? platterAudioSample_->isPlaying.load() : -1));
+
+    // Final state log (Log 3 & 4 again) for completeness after storing targetAudioRate, using the specified format
+    ALOGV("AudioEngine::scratchPlatterActiveInternal - PlatterSample State: useEngineRate:%d, isPlaying:%d", 
+          (platterAudioSample_ ? platterAudioSample_->useEngineRateForPlayback_.load() : -1), 
+          (platterAudioSample_ ? platterAudioSample_->isPlaying.load() : -1));
 }
 
 void AudioEngine::releasePlatterTouchInternal() {
@@ -784,11 +1026,21 @@ extern "C" JNIEXPORT jstring JNICALL
 Java_com_example_fromscratch_MainActivity_stringFromJNI(JNIEnv* env, jobject /* this */) {
     ALOGI("JNI: stringFromJNI called!");
     std::string hello = "Hello from C++ (Consolidated native-lib.cpp)";
-    if (gAudioEngine && gAudioEngine.get() != nullptr) {
+    if (gAudioEngine && gAudioEngine.get() != nullptr) { // NOLINT(*-simplify-boolean-expr)
         hello += " - AudioEngine Initialized and valid.";
     } else {
         hello += " - AudioEngine IS NULL or NOT Initialized.";
     }
     return env->NewStringUTF(hello.c_str());
+}
+
+JNIEXPORT void JNICALL
+Java_com_example_fromscratch_MainActivity_setAudioNormalizationFactor(JNIEnv *env, jobject /* this */, jfloat degreesPerFrame) {
+    ALOGI("JNI: setAudioNormalizationFactor called with degreesPerFrame: %.4f", degreesPerFrame);
+    if (gAudioEngine) {
+        gAudioEngine->setDegreesPerFrameForUnityRateInternal(static_cast<float>(degreesPerFrame));
+    } else {
+        ALOGE("JNI: AudioEngine not initialized for setAudioNormalizationFactor.");
+    }
 }
 } // extern "C"

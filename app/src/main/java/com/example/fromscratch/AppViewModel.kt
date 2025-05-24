@@ -27,13 +27,15 @@ class AppViewModel( // This should be the only declaration of this class in this
     private val onUpdateMusicMasterVolume: (volume: Float) -> Unit,
     private val onScratchPlatterActive: (isActive: Boolean, angleDeltaOrRate: Float) -> Unit,
     private val onReleasePlatterTouch: () -> Unit,
-    private val onUpdateScratchSensitivity: (sensitivity: Float) -> Unit
+    private val onUpdateScratchSensitivity: (sensitivity: Float) -> Unit,
+    private val onSetAudioNormalizationFactor: (degrees: Float) -> Unit // New lambda
 ) : ViewModel() {
 
     var currentScreen by mutableStateOf<AppScreen>(AppScreen.Loading)
         private set
     var showSettingsDialog by mutableStateOf(false)
         private set
+    var showSubscribePopup by mutableStateOf(false) // Added for premium feature popup
 
     // --- Platter and Vinyl Mechanics ---
     var visualPlatterAngle by mutableFloatStateOf(0f)
@@ -50,7 +52,7 @@ class AppViewModel( // This should be the only declaration of this class in this
     // --- Tunable Parameters (with defaults) ---
     var slipmatDampingFactor by mutableFloatStateOf(0.05f)
         private set
-    var scratchSensitivitySetting by mutableFloatStateOf(0.05f) // User-facing setting
+    var scratchSensitivitySetting by mutableFloatStateOf(1.0f) // New default value
         private set
 
 
@@ -76,6 +78,10 @@ class AppViewModel( // This should be the only declaration of this class in this
         Log.d("AppViewModel", "Initial Scratch Sensitivity (Kotlin): $scratchSensitivitySetting, Damping: $slipmatDampingFactor")
         // Send initial sensitivity to native layer
         onUpdateScratchSensitivity(scratchSensitivitySetting)
+        // Send the normalization factor to native layer
+        Log.d("AppViewModel", "Setting Audio Normalization Factor (degreesPerFrameAtPlatterRPM): $degreesPerFrameAtPlatterRPM")
+        onSetAudioNormalizationFactor(degreesPerFrameAtPlatterRPM.toFloat())
+
 
         viewModelScope.launch {
             Log.d("AppViewModel", "ViewModel init coroutine launched.")
@@ -117,7 +123,8 @@ class AppViewModel( // This should be the only declaration of this class in this
                             if (vinylSpeed == 0f) 0f else 1f // Avoid division by zero; default to 1.0 if platterRPM is 0 but vinyl moves
                         }
                         onScratchPlatterActive(false, normalizedAudioRate)
-                        // Log.v("AppViewModel_Loop", "Coasting/Normal. vinylSpeed: $vinylSpeed, normalizedAudioRate: $normalizedAudioRate")
+                        // Log 2: Log normalizedAudioRate during coasting/normal playback (Commented out)
+                        // Log.v("AppViewModel_Coasting", "normalizedAudioRate: $normalizedAudioRate, vinylSpeed: $vinylSpeed")
 
                     }
                     // else: Platter is touched. vinylSpeed is set directly by onPlatterDrag,
@@ -145,8 +152,13 @@ class AppViewModel( // This should be the only declaration of this class in this
 
     fun handleButton1Hold() {
         Log.i("AppViewModel_Button1", "handleButton1Hold() CALLED")
-        Log.d("AppViewModel_Button1", "Button 1 Hold: Request User Platter Sample Upload (Placeholder)")
-        // onLoadUserPlatterSample("path/to/user/sample") // Example
+        if (MainActivity.isCurrentUserPremium) {
+            Log.d("AppViewModel_Button1", "Premium user: Triggering user platter sample loading (placeholder).")
+            // onLoadUserPlatterSample("path/to/user/sample") // Example - premium feature
+        } else {
+            Log.d("AppViewModel_Button1", "Non-premium user: Showing subscribe popup.")
+            showSubscribePopup = true
+        }
     }
 
     fun handleButton2Press() {
@@ -180,8 +192,13 @@ class AppViewModel( // This should be the only declaration of this class in this
 
     fun handleButton2Hold() {
         Log.i("AppViewModel_Button2", "handleButton2Hold() CALLED")
-        Log.d("AppViewModel_Button2", "Button 2 Hold: Request User Music Track Upload (Placeholder)")
-        // onLoadUserMusicTrack("path/to/user/track") // Example
+        if (MainActivity.isCurrentUserPremium) {
+            Log.d("AppViewModel_Button2", "Premium user: Triggering user music track loading (placeholder).")
+            // onLoadUserMusicTrack("path/to/user/track") // Example - premium feature
+        } else {
+            Log.d("AppViewModel_Button2", "Non-premium user: Showing subscribe popup.")
+            showSubscribePopup = true
+        }
     }
 
     fun handleHoldBothButtons() {
@@ -207,8 +224,8 @@ class AppViewModel( // This should be the only declaration of this class in this
     }
 
     fun onScratchSensitivityChange(newSensitivity: Float) {
-        scratchSensitivitySetting = newSensitivity.coerceIn(0.005f, 0.2f)
-        Log.i("AppViewModel_Settings", "Scratch Sensitivity changed to: $scratchSensitivitySetting")
+        scratchSensitivitySetting = newSensitivity.coerceIn(0.25f, 4.0f) // Adjusted range
+        Log.i("AppViewModel_Settings", "Scratch Sensitivity (Normalized Rate Multiplier) changed to: $scratchSensitivitySetting")
         onUpdateScratchSensitivity(scratchSensitivitySetting) // Inform C++
     }
 
@@ -219,7 +236,9 @@ class AppViewModel( // This should be the only declaration of this class in this
 
     // Called from PlatterView when touch starts
     fun onPlatterTouchDown() {
-        Log.d("AppViewModel_Platter", "onPlatterTouchDown called.")
+        // Log 4: Log touch down event (Commented out)
+        // Log.v("AppViewModel_PlatterTouchDown", "Touch Down.")
+        // Log.d("AppViewModel_Platter", "onPlatterTouchDown called.") // Original log, can be kept or removed
         isPlatterTouched = true
         vinylSpeed = 0f // Stop vinyl visually immediately
         // Inform C++ that touch is active and current movement (or lack thereof) is 0.
@@ -229,6 +248,8 @@ class AppViewModel( // This should be the only declaration of this class in this
 
     // Called from PlatterView during drag
     fun onPlatterDrag(angleDelta: Float) {
+        // Log 1: Log angleDelta at the beginning of onPlatterDrag (Commented out)
+        // Log.v("AppViewModel_PlatterDrag", "angleDelta: $angleDelta")
         if (isPlatterTouched) {
             // Update visual angle of the vinyl
             vinylAngle = (vinylAngle + angleDelta) % 360f
@@ -246,7 +267,9 @@ class AppViewModel( // This should be the only declaration of this class in this
 
     // Called from PlatterView when touch ends
     fun onPlatterTouchUp() {
-        Log.d("AppViewModel_Platter", "onPlatterTouchUp called. Current visual vinylSpeed before release: $vinylSpeed")
+        // Log 3: Log current vinylSpeed at the beginning of onPlatterTouchUp (Commented out)
+        // Log.v("AppViewModel_PlatterTouchUp", "Touch Up. Current vinylSpeed: $vinylSpeed")
+        // Log.d("AppViewModel_Platter", "onPlatterTouchUp called. Current visual vinylSpeed before release: $vinylSpeed") // Original log
         isPlatterTouched = false
         // Inform C++ that touch has been released.
         // The C++ side's releasePlatterTouchInternal() sets useEngineRateForPlayback_ to true.

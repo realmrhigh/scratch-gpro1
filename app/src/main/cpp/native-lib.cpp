@@ -199,6 +199,7 @@ public:
     std::atomic<float> platterTargetPlaybackRate_{1.0f};
     std::atomic<float> scratchSensitivity_{0.17f};
     const float MOVEMENT_THRESHOLD = 0.001f;
+    float degreesPerFrameForUnityRate_ = 2.5f; // Default, will be updated from Kotlin
 
     AudioEngine() : appAssetManager_(nullptr), streamSampleRate_(0) {
         ALOGI("AudioEngine default constructor.");
@@ -235,10 +236,21 @@ public:
         scratchSensitivity_.store(sensitivity);
         ALOGE("AudioEngine: CONFIRMED scratchSensitivity_ (member) is now %.4f after store", scratchSensitivity_.load());
     }
+    void setDegreesPerFrameForUnityRateInternal(float degrees) {
+        if (degrees > 0.0f) { // Basic validation
+            degreesPerFrameForUnityRate_ = degrees;
+            ALOGI("AudioEngine: degreesPerFrameForUnityRate_ set to %.4f", degreesPerFrameForUnityRate_);
+        } else {
+            ALOGE("AudioEngine: Invalid degreesPerFrameForUnityRate_ value: %.4f", degrees);
+        }
+    }
 
     oboe::DataCallbackResult onAudioReady(oboe::AudioStream* stream, void* audioData, int32_t numFrames) override;
     void onErrorBeforeClose(oboe::AudioStream *stream, oboe::Result error) override;
     void onErrorAfterClose(oboe::AudioStream *stream, oboe::Result error) override;
+
+    // Getter for isFingerDownOnPlatter_
+    bool isPlatterTouched() const { return isFingerDownOnPlatter_.load(); }
 
 private:
     std::shared_ptr<oboe::AudioStream> audioStream_;
@@ -324,8 +336,13 @@ void AudioSample::load(AAssetManager* assetManager, const std::string& basePath,
 
 void AudioSample::getAudio(float* outputBuffer, int32_t numOutputFrames, int32_t outputStreamChannels,
                            float effectiveVolume) {
-    if (!isPlaying.load() || audioData.empty() || totalFrames == 0 || channels == 0) {
-        return;
+    bool doLog = false;
+    bool isPlatterTouched_engine = false;
+    if (audioEnginePtr != nullptr) {
+        isPlatterTouched_engine = audioEnginePtr->isPlatterTouched();
+        if (isPlatterTouched_engine) {
+            doLog = true;
+        }
     }
 
     float localPreciseCurrentFrame = preciseCurrentFrame.load();
@@ -333,26 +350,82 @@ void AudioSample::getAudio(float* outputBuffer, int32_t numOutputFrames, int32_t
 
     if (useEngineRateForPlayback_.load() && audioEnginePtr != nullptr) {
         playbackRateToUse = audioEnginePtr->platterTargetPlaybackRate_.load();
-        if (std::fabs(playbackRateToUse) < 0.00001f) {
-            return;
-        }
     }
 
-    float frameAtLoopStart = localPreciseCurrentFrame;
+    if (doLog) {
+        // Variables for logging, matching the requested items
+        const char* log_filePath = this->filePath.c_str(); // Item 1
+        float log_initialFrame = localPreciseCurrentFrame;    // Item 2
+        bool log_isPlaying = isPlaying.load();              // Item 3
+        bool log_useEngineRate = useEngineRateForPlayback_.load(); // Item 4
+        bool log_enginePtrValid = (audioEnginePtr != nullptr); // Item 5
+        // Item 6a (isPlatterTouched_engine) is already available
+        float log_enginePlatterRate = -1.0f; // Item 6b (placeholder if not applicable)
+        if (log_useEngineRate && audioEnginePtr != nullptr) {
+            log_enginePlatterRate = audioEnginePtr->platterTargetPlaybackRate_.load();
+        }
+        // Item 7 (playbackRateToUse) is already available
+        int log_totalFrames = this->totalFrames; // For context
 
+        ALOGV("AudioSample::getAudio[%s] FingerDown:%d - StartFrame:%.2f, isPlaying:%d, useEngineRate:%d, enginePtrValid:%d, enginePlatterRate:%.2f, finalPlaybackRate:%.2f, totalFrames:%d",
+              log_filePath,
+              isPlatterTouched_engine, // This is the direct result of audioEnginePtr->isPlatterTouched()
+              log_initialFrame,
+              log_isPlaying,
+              log_useEngineRate,
+              log_enginePtrValid,
+              log_enginePlatterRate,
+              playbackRateToUse,
+              log_totalFrames);
+    }
+
+    // Standard checks for playability
+    if (!isPlaying.load() || audioData.empty() || totalFrames == 0 || channels == 0) {
+        if (doLog) { // Log if returning early during a finger-down scenario
+            ALOGV("AudioSample::getAudio[%s] FingerDown:%d - RETURNING EARLY. isPlaying:%d, audioEmpty:%d, totalFrames:%d, channels:%d. Frame:%.2f",
+                  this->filePath.c_str(), isPlatterTouched_engine, isPlaying.load(), audioData.empty(), totalFrames, channels, localPreciseCurrentFrame);
+        }
+        return;
+    }
+
+    // Main processing loop
+    // localPreciseCurrentFrame will be modified within this loop
     for (int i = 0; i < numOutputFrames; ++i) {
+        if (!isPlaying.load()) {
+            if (doLog) ALOGV("AudioSample::getAudio[%s] FingerDown:%d - Loop iter %d: Breaking loop, isPlaying is false. Frame: %.2f", this->filePath.c_str(), isPlatterTouched_engine, i, localPreciseCurrentFrame);
+            break;
+        }
+
+        // Boundary logic
         if (localPreciseCurrentFrame >= static_cast<float>(totalFrames) || localPreciseCurrentFrame < 0.0f) {
             if (playOnceThenLoopSilently && !playedOnce) {
+                if (doLog) ALOGV("AudioSample::getAudio[%s] FingerDown:%d - Loop iter %d: playOnceThenLoopSilently path. Frame: %.2f", this->filePath.c_str(), isPlatterTouched_engine, i, localPreciseCurrentFrame);
                 playedOnce = true; localPreciseCurrentFrame = 0.0f;
                 if (!loop.load()) loop.store(true);
             } else if (loop.load()) {
                 if (totalFrames > 0) {
+                    if (doLog && (localPreciseCurrentFrame >= static_cast<float>(totalFrames) || localPreciseCurrentFrame < 0.0f)) {
+                         ALOGV("AudioSample::getAudio[%s] FingerDown:%d - Loop iter %d: Looping frame. Before: %.2f", this->filePath.c_str(), isPlatterTouched_engine, i, localPreciseCurrentFrame);
+                    }
                     localPreciseCurrentFrame = fmodf(localPreciseCurrentFrame, static_cast<float>(totalFrames));
                     if (localPreciseCurrentFrame < 0.0f) localPreciseCurrentFrame += static_cast<float>(totalFrames);
-                } else localPreciseCurrentFrame = 0.0f;
-            } else { isPlaying.store(false); break; }
+                    if (doLog && (localPreciseCurrentFrame >= static_cast<float>(totalFrames) || localPreciseCurrentFrame < 0.0f)) { // Should ideally not happen after correction
+                         ALOGV("AudioSample::getAudio[%s] FingerDown:%d - Loop iter %d: Looping frame. After: %.2f", this->filePath.c_str(), isPlatterTouched_engine, i, localPreciseCurrentFrame);
+                    }
+                } else {
+                     localPreciseCurrentFrame = 0.0f;
+                }
+            } else { // Not looping, and beyond boundaries
+                if (doLog) ALOGV("AudioSample::getAudio[%s] FingerDown:%d - Loop iter %d: End of non-looping sample. Setting isPlaying=false. Frame: %.2f", this->filePath.c_str(), isPlatterTouched_engine, i, localPreciseCurrentFrame);
+                isPlaying.store(false);
+                break; 
+            }
         }
-        if (!isPlaying.load()) break;
+        
+        if (!isPlaying.load()) { // Re-check after boundary logic might have changed isPlaying
+             if (doLog) ALOGV("AudioSample::getAudio[%s] FingerDown:%d - Loop iter %d: Breaking loop (post-boundary logic), isPlaying is false. Frame: %.2f", this->filePath.c_str(), isPlatterTouched_engine, i, localPreciseCurrentFrame);
+             break;
+        }
 
         float fractionalTime = localPreciseCurrentFrame - std::floor(localPreciseCurrentFrame);
         int32_t baseFrameIndex = static_cast<int32_t>(std::floor(localPreciseCurrentFrame));
@@ -669,63 +742,82 @@ void AudioEngine::setMusicMasterVolumeInternal(float volume) {
 
 // MODIFIED: Logic to handle coasting rates and isPlaying state
 void AudioEngine::scratchPlatterActiveInternal(bool isActiveTouch, float angleDeltaOrRateFromViewModel) {
+    // Log 1: Input parameters
+    ALOGV("AudioEngine::scratchPlatterActiveInternal - Input: isActiveTouch:%d, angleDeltaOrRate:%.4f", isActiveTouch, angleDeltaOrRateFromViewModel);
+
     isFingerDownOnPlatter_.store(isActiveTouch);
 
     if (!platterAudioSample_ || platterAudioSample_->totalFrames == 0) {
         if(isActiveTouch) ALOGW("ScratchPlatterActive: Attempt on unloaded/invalid platter sample.");
-        if(platterAudioSample_) platterAudioSample_->useEngineRateForPlayback_.store(false);
+        if(platterAudioSample_) { 
+            platterAudioSample_->useEngineRateForPlayback_.store(false);
+            // Log 3 & 4 for early exit path, using the specified format
+            ALOGV("AudioEngine::scratchPlatterActiveInternal - PlatterSample State: useEngineRate:%d, isPlaying:%d", platterAudioSample_->useEngineRateForPlayback_.load(), platterAudioSample_->isPlaying.load());
+        }
         return;
     }
 
     platterAudioSample_->useEngineRateForPlayback_.store(true);
+    // Log 3 & 4 after setting useEngineRateForPlayback_, using the specified format
+    ALOGV("AudioEngine::scratchPlatterActiveInternal - PlatterSample State: useEngineRate:%d, isPlaying:%d", platterAudioSample_->useEngineRateForPlayback_.load(), platterAudioSample_->isPlaying.load());
+    
     float targetAudioRate;
     float currentSensitivity = scratchSensitivity_.load();
 
-    ALOGE("ScratchPlatterActive INPUT: isActiveTouch: %d, angleDeltaOrRateFromVM: %.4f, ACTUAL currentSensitivity_ LOADED: %.4f",
+    // This ALOGE was for specific debugging by the user, kept as ALOGE.
+    ALOGE("ScratchPlatterActive INPUT (Detail): isActiveTouch: %d, angleDeltaOrRateFromVM: %.4f, Sensitivity: %.4f",
           isActiveTouch, angleDeltaOrRateFromViewModel, currentSensitivity);
 
     if (isActiveTouch) { // Finger is actively interacting (touch down or drag)
         if (std::fabs(angleDeltaOrRateFromViewModel) > MOVEMENT_THRESHOLD) { // Finger is moving
-            targetAudioRate = angleDeltaOrRateFromViewModel * currentSensitivity;
+            // targetAudioRate = angleDeltaOrRateFromViewModel * currentSensitivity; // Old logic
+            float normalizedInputRate = 0.0f;
+            if (std::fabs(degreesPerFrameForUnityRate_) > 0.00001f) { // Avoid division by zero
+                normalizedInputRate = angleDeltaOrRateFromViewModel / degreesPerFrameForUnityRate_;
+            } else if (std::fabs(angleDeltaOrRateFromViewModel) > 0.00001f) {
+                 // If degreesPerFrameForUnityRate_ is zero but there's movement,
+                 // this is an undefined state, but use sensitivity directly as a fallback to avoid silence.
+                normalizedInputRate = angleDeltaOrRateFromViewModel;
+            }
+            targetAudioRate = normalizedInputRate * currentSensitivity;
+
             targetAudioRate = std::clamp(targetAudioRate, -4.0f, 4.0f);
             if (!platterAudioSample_->isPlaying.load()) {
-                ALOGV("Scratch Move: angleDelta: %.2f, currentSensitivity: %.4f, target rate: %.4f. Setting isPlaying=true.",
-                      angleDeltaOrRateFromViewModel, currentSensitivity, targetAudioRate);
                 platterAudioSample_->isPlaying.store(true);
-            } else {
-                ALOGV("Scratch Move: angleDelta: %.2f, currentSensitivity: %.4f, target rate: %.4f. isPlaying already true.",
-                      angleDeltaOrRateFromViewModel, currentSensitivity, targetAudioRate);
             }
-        } else { // Finger is down, but not moving (angleDeltaOrRateFromViewModel is 0 from onPlatterTouchDown)
+        } else { // Finger is down, but not moving
             targetAudioRate = 0.0f;
             if (platterAudioSample_->isPlaying.load()) {
-                ALOGV("Scratch Hold: No significant movement. Setting isPlaying=false. Target rate: %.4f", targetAudioRate);
                 platterAudioSample_->isPlaying.store(false);
-            } else {
-                ALOGV("Scratch Hold: Already silent or becoming silent. Target rate: %.4f", targetAudioRate);
             }
         }
-    } else { // Finger is NOT on platter (isActiveTouch is false), ViewModel is sending a coasting/damped rate
-        targetAudioRate = angleDeltaOrRateFromViewModel; // This is the desired normalized audio rate
-        ALOGV("Coasting/NotTouched: Received rate from ViewModel: %.4f", targetAudioRate);
+        // Log 3 & 4 after potential modifications in isActiveTouch=true branch, using the specified format
+        ALOGV("AudioEngine::scratchPlatterActiveInternal - PlatterSample State: useEngineRate:%d, isPlaying:%d", platterAudioSample_->useEngineRateForPlayback_.load(), platterAudioSample_->isPlaying.load());
 
-        // If coasting rate is non-zero, audio should be playing.
-        // If coasting rate becomes zero (vinyl has stopped), audio should stop.
-        if (std::fabs(targetAudioRate) > 0.00001f) {
+    } else { // Finger is NOT on platter (isActiveTouch is false)
+        targetAudioRate = angleDeltaOrRateFromViewModel; // This is the desired normalized audio rate
+        
+        if (std::fabs(targetAudioRate) > 0.00001f) { // If coasting rate is non-zero
             if(!platterAudioSample_->isPlaying.load()) {
-                ALOGV("Coasting: Rate: %.4f. Setting isPlaying=true.", targetAudioRate);
                 platterAudioSample_->isPlaying.store(true);
             }
-        } else {
+        } else { // Coasting rate is effectively zero
             if(platterAudioSample_->isPlaying.load()) {
-                ALOGV("Coasting: Rate is effectively zero (%.4f). Setting isPlaying=false.", targetAudioRate);
                 platterAudioSample_->isPlaying.store(false);
             }
         }
+        // Log 3 & 4 after potential modifications in isActiveTouch=false branch, using the specified format
+        ALOGV("AudioEngine::scratchPlatterActiveInternal - PlatterSample State: useEngineRate:%d, isPlaying:%d", platterAudioSample_->useEngineRateForPlayback_.load(), platterAudioSample_->isPlaying.load());
     }
+
+    // Log 2: Calculated targetAudioRate before storing
+    ALOGV("AudioEngine::scratchPlatterActiveInternal - Calculated: targetAudioRate:%.4f", targetAudioRate);
     platterTargetPlaybackRate_.store(targetAudioRate);
-    ALOGV("scratchPlatterActiveInternal END: Final platterTargetPlaybackRate_ set to: %.4f, isPlaying: %d",
-          targetAudioRate, (platterAudioSample_ ? platterAudioSample_->isPlaying.load() : -1));
+
+    // Final state log (Log 3 & 4 again) for completeness after storing targetAudioRate, using the specified format
+    ALOGV("AudioEngine::scratchPlatterActiveInternal - PlatterSample State: useEngineRate:%d, isPlaying:%d", 
+          (platterAudioSample_ ? platterAudioSample_->useEngineRateForPlayback_.load() : -1), 
+          (platterAudioSample_ ? platterAudioSample_->isPlaying.load() : -1));
 }
 
 void AudioEngine::releasePlatterTouchInternal() {
@@ -934,11 +1026,21 @@ extern "C" JNIEXPORT jstring JNICALL
 Java_com_example_fromscratch_MainActivity_stringFromJNI(JNIEnv* env, jobject /* this */) {
     ALOGI("JNI: stringFromJNI called!");
     std::string hello = "Hello from C++ (Consolidated native-lib.cpp)";
-    if (gAudioEngine && gAudioEngine.get() != nullptr) {
+    if (gAudioEngine && gAudioEngine.get() != nullptr) { // NOLINT(*-simplify-boolean-expr)
         hello += " - AudioEngine Initialized and valid.";
     } else {
         hello += " - AudioEngine IS NULL or NOT Initialized.";
     }
     return env->NewStringUTF(hello.c_str());
+}
+
+JNIEXPORT void JNICALL
+Java_com_example_fromscratch_MainActivity_setAudioNormalizationFactor(JNIEnv *env, jobject /* this */, jfloat degreesPerFrame) {
+    ALOGI("JNI: setAudioNormalizationFactor called with degreesPerFrame: %.4f", degreesPerFrame);
+    if (gAudioEngine) {
+        gAudioEngine->setDegreesPerFrameForUnityRateInternal(static_cast<float>(degreesPerFrame));
+    } else {
+        ALOGE("JNI: AudioEngine not initialized for setAudioNormalizationFactor.");
+    }
 }
 } // extern "C"
